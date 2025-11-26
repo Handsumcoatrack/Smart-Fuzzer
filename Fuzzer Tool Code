@@ -1,0 +1,765 @@
+import requests
+import sys
+import threading
+import time
+import re
+import hashlib
+import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue
+
+class ThreadedFuzzer:
+    def __init__(self, target_url, wordlist_path, threads=10, delay=0, retries=3, 
+                 retry_delay=1, match_strings=None, match_regex=None, 
+                 exclude_strings=None, exclude_regex=None, baseline_count=3,
+                 length_threshold=50, similarity_threshold=0.9, method='GET',
+                 headers=None, cookies=None, post_data=None, 
+                 additional_wordlists=None):
+        self.target_url = target_url
+        self.wordlist_path = wordlist_path
+        self.threads = threads
+        self.delay = delay
+        self.retries = retries
+        self.retry_delay = retry_delay
+        
+        # HTTP options
+        self.method = method.upper()
+        self.headers = headers or {}
+        self.cookies = cookies or {}
+        self.post_data = post_data  # Can contain FUZZ placeholders
+        
+        # Content matching options
+        self.match_strings = match_strings or []
+        self.match_regex = match_regex or []
+        self.exclude_strings = exclude_strings or []
+        self.exclude_regex = exclude_regex or []
+        
+        # Baseline comparison options
+        self.baseline_count = baseline_count
+        self.length_threshold = length_threshold
+        self.similarity_threshold = similarity_threshold
+        
+        # Multiple injection points
+        self.additional_wordlists = additional_wordlists or []
+        self.injection_points = self.count_injection_points()
+        
+        # Baseline data
+        self.baseline = {
+            'status_codes': set(),
+            'content_lengths': [],
+            'avg_length': 0,
+            'content_hashes': set(),
+            'common_words': set(),
+            'length_stddev': 0
+        }
+        
+        # Compile regex patterns
+        self.compiled_match_regex = [re.compile(p, re.IGNORECASE) for p in self.match_regex]
+        self.compiled_exclude_regex = [re.compile(p, re.IGNORECASE) for p in self.exclude_regex]
+        
+        # Connection pooling
+        self.session = requests.Session()
+        
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=threads,
+            pool_maxsize=threads
+        )
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
+        
+        # Set default headers
+        if self.headers:
+            self.session.headers.update(self.headers)
+        
+        # Set cookies
+        if self.cookies:
+            self.session.cookies.update(self.cookies)
+        
+        # Thread-safe printing
+        self.print_lock = threading.Lock()
+        
+        # Store results
+        self.results = []
+        self.results_lock = threading.Lock()
+        
+        # Track errors
+        self.errors = []
+        self.errors_lock = threading.Lock()
+        
+        # Track content matches
+        self.content_matches = []
+        self.content_matches_lock = threading.Lock()
+        
+        # Track baseline anomalies
+        self.anomalies = []
+        self.anomalies_lock = threading.Lock()
+        
+        # Global rate limiting
+        self.last_request_time = 0
+        self.rate_lock = threading.Lock()
+    
+    def count_injection_points(self):
+        """Count FUZZ, FUZZ2, FUZZ3, etc. in URL, headers, and post data"""
+        points = set()
+        
+        # Check URL
+        points.update(re.findall(r'FUZZ\d*', self.target_url))
+        
+        # Check headers
+        for key, value in self.headers.items():
+            points.update(re.findall(r'FUZZ\d*', key))
+            points.update(re.findall(r'FUZZ\d*', value))
+        
+        # Check post data
+        if self.post_data:
+            points.update(re.findall(r'FUZZ\d*', self.post_data))
+        
+        return sorted(points, key=lambda x: (len(x), x))
+    
+    def load_wordlist(self, path=None):
+        """Load words from wordlist file"""
+        path = path or self.wordlist_path
+        try:
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read().splitlines()
+        except FileNotFoundError:
+            print(f"[!] Wordlist not found: {path}")
+            return []
+        except PermissionError:
+            print(f"[!] Permission denied reading: {path}")
+            return []
+        except Exception as e:
+            print(f"[!] Error loading wordlist: {e}")
+            return []
+    
+    def generate_payload_combinations(self):
+        """Generate all combinations of payloads for multiple injection points"""
+        # Load primary wordlist for FUZZ
+        primary_words = self.load_wordlist(self.wordlist_path)
+        
+        if not primary_words:
+            return []
+        
+        # If only one injection point, return simple list
+        if len(self.injection_points) <= 1:
+            return [(word,) for word in primary_words]
+        
+        # Load additional wordlists for FUZZ2, FUZZ3, etc.
+        all_wordlists = [primary_words]
+        
+        for i, wordlist_path in enumerate(self.additional_wordlists):
+            words = self.load_wordlist(wordlist_path)
+            if words:
+                all_wordlists.append(words)
+            else:
+                self.safe_print(f"[!] Warning: Could not load wordlist for {self.injection_points[i+1]}")
+                all_wordlists.append([''])
+        
+        # Pad with empty lists if not enough wordlists provided
+        while len(all_wordlists) < len(self.injection_points):
+            self.safe_print(f"[!] Warning: No wordlist for {self.injection_points[len(all_wordlists)]}, using primary")
+            all_wordlists.append(primary_words)
+        
+        # Generate cartesian product of all wordlists
+        combinations = []
+        self.generate_combinations_recursive(all_wordlists, 0, [], combinations)
+        
+        return combinations
+    
+    def generate_combinations_recursive(self, wordlists, index, current, results):
+        """Recursively generate all combinations"""
+        if index == len(wordlists):
+            results.append(tuple(current))
+            return
+        
+        for word in wordlists[index]:
+            self.generate_combinations_recursive(wordlists, index + 1, current + [word], results)
+    
+    def apply_payloads(self, payloads):
+        """Apply payloads to all injection points, returns (url, data)"""
+        url = self.target_url
+        data = self.post_data
+        headers = dict(self.headers)
+        
+        # Map payloads to injection points
+        payload_map = {}
+        for i, point in enumerate(self.injection_points):
+            if i < len(payloads):
+                payload_map[point] = payloads[i]
+            else:
+                payload_map[point] = ''
+        
+        # Replace in URL (process longer patterns first to avoid partial replacement)
+        for point in sorted(payload_map.keys(), key=len, reverse=True):
+            url = url.replace(point, payload_map[point])
+        
+        # Replace in POST data
+        if data:
+            for point in sorted(payload_map.keys(), key=len, reverse=True):
+                data = data.replace(point, payload_map[point])
+        
+        # Replace in headers
+        new_headers = {}
+        for key, value in headers.items():
+            new_key = key
+            new_value = value
+            for point in sorted(payload_map.keys(), key=len, reverse=True):
+                new_key = new_key.replace(point, payload_map[point])
+                new_value = new_value.replace(point, payload_map[point])
+            new_headers[new_key] = new_value
+        
+        return url, data, new_headers
+    
+    def safe_print(self, message):
+        """Thread-safe printing"""
+        with self.print_lock:
+            print(message)
+    
+    def log_error(self, error_type, url, details=""):
+        """Track errors for final summary"""
+        with self.errors_lock:
+            self.errors.append({
+                'type': error_type,
+                'url': url,
+                'details': details
+            })
+    
+    def apply_rate_limit(self):
+        """Enforce delay between requests globally"""
+        if self.delay <= 0:
+            return
+        
+        with self.rate_lock:
+            current_time = time.time()
+            time_since_last = current_time - self.last_request_time
+            
+            if time_since_last < self.delay:
+                sleep_time = self.delay - time_since_last
+                time.sleep(sleep_time)
+            
+            self.last_request_time = time.time()
+    
+    def get_content_hash(self, content):
+        """Generate hash of content for comparison"""
+        return hashlib.md5(content.encode()).hexdigest()
+    
+    def extract_words(self, content):
+        """Extract significant words from content for similarity"""
+        text = re.sub(r'<[^>]+>', ' ', content)
+        words = set(re.findall(r'\b[a-zA-Z]{4,}\b', text.lower()))
+        return words
+    
+    def calculate_similarity(self, words1, words2):
+        """Calculate Jaccard similarity between two word sets"""
+        if not words1 and not words2:
+            return 1.0
+        if not words1 or not words2:
+            return 0.0
+        
+        intersection = len(words1 & words2)
+        union = len(words1 | words2)
+        
+        return intersection / union if union > 0 else 0.0
+    
+    def establish_baseline(self):
+        """Make requests with random/unlikely payloads to establish baseline"""
+        self.safe_print("[*] Establishing baseline with non-existent paths...")
+        
+        baseline_words = [
+            'thispathshouldnotexist12345',
+            'randomnonexistent98765',
+            'definitelynotarealpath54321',
+            'baselinetest99999',
+            'fakepathforbaseline11111'
+        ]
+        
+        responses = []
+        
+        for word in baseline_words[:self.baseline_count]:
+            # Create payloads tuple with same word for all injection points
+            payloads = tuple([word] * len(self.injection_points)) if self.injection_points else (word,)
+            url, data, headers = self.apply_payloads(payloads)
+            
+            try:
+                self.apply_rate_limit()
+                
+                if self.method == 'GET':
+                    response = self.session.get(url, headers=headers, timeout=5)
+                elif self.method == 'POST':
+                    response = self.session.post(url, data=data, headers=headers, timeout=5)
+                elif self.method == 'PUT':
+                    response = self.session.put(url, data=data, headers=headers, timeout=5)
+                elif self.method == 'DELETE':
+                    response = self.session.delete(url, headers=headers, timeout=5)
+                else:
+                    response = self.session.request(self.method, url, data=data, headers=headers, timeout=5)
+                
+                responses.append({
+                    'status': response.status_code,
+                    'length': len(response.content),
+                    'content': response.text,
+                    'hash': self.get_content_hash(response.text),
+                    'words': self.extract_words(response.text)
+                })
+                
+                self.safe_print(f"    Baseline {len(responses)}: [{response.status_code}] [{len(response.content)} bytes]")
+                
+            except requests.exceptions.RequestException as e:
+                self.safe_print(f"    Baseline request failed: {e}")
+        
+        if not responses:
+            self.safe_print("[!] Could not establish baseline - no successful requests")
+            return False
+        
+        for r in responses:
+            self.baseline['status_codes'].add(r['status'])
+            self.baseline['content_lengths'].append(r['length'])
+            self.baseline['content_hashes'].add(r['hash'])
+            self.baseline['common_words'].update(r['words'])
+        
+        self.baseline['avg_length'] = sum(self.baseline['content_lengths']) / len(self.baseline['content_lengths'])
+        
+        if len(self.baseline['content_lengths']) > 1:
+            variance = sum((l - self.baseline['avg_length']) ** 2 for l in self.baseline['content_lengths'])
+            self.baseline['length_stddev'] = (variance / len(self.baseline['content_lengths'])) ** 0.5
+        
+        self.safe_print(f"\n[+] Baseline established:")
+        self.safe_print(f"    Status codes: {self.baseline['status_codes']}")
+        self.safe_print(f"    Avg length: {self.baseline['avg_length']:.0f} bytes (±{self.baseline['length_stddev']:.0f})")
+        self.safe_print(f"    Unique hashes: {len(self.baseline['content_hashes'])}")
+        
+        return True
+    
+    def check_baseline_anomaly(self, response):
+        """Compare response against baseline"""
+        reasons = []
+        
+        status = response.status_code
+        length = len(response.content)
+        content = response.text
+        content_hash = self.get_content_hash(content)
+        
+        if status not in self.baseline['status_codes']:
+            reasons.append(f"unusual status: {status}")
+        
+        length_diff = abs(length - self.baseline['avg_length'])
+        if length_diff > self.length_threshold:
+            if self.baseline['length_stddev'] > 0:
+                stddev_diff = length_diff / self.baseline['length_stddev']
+                if stddev_diff > 2:
+                    reasons.append(f"length anomaly: {length} bytes (baseline avg: {self.baseline['avg_length']:.0f})")
+            else:
+                reasons.append(f"length anomaly: {length} bytes (baseline: {self.baseline['avg_length']:.0f})")
+        
+        if content_hash not in self.baseline['content_hashes']:
+            response_words = self.extract_words(content)
+            similarity = self.calculate_similarity(response_words, self.baseline['common_words'])
+            
+            if similarity < self.similarity_threshold:
+                reasons.append(f"content differs: {similarity:.1%} similarity")
+        
+        return (len(reasons) > 0, reasons)
+    
+    def check_content_match(self, content):
+        """Check if response content matches any patterns"""
+        matched_items = []
+        
+        for exclude_str in self.exclude_strings:
+            if exclude_str.lower() in content.lower():
+                return (False, [], True)
+        
+        for pattern in self.compiled_exclude_regex:
+            if pattern.search(content):
+                return (False, [], True)
+        
+        for match_str in self.match_strings:
+            if match_str.lower() in content.lower():
+                matched_items.append(f"string: '{match_str}'")
+        
+        for i, pattern in enumerate(self.compiled_match_regex):
+            match = pattern.search(content)
+            if match:
+                matched_items.append(f"regex: '{self.match_regex[i]}' -> '{match.group()[:30]}'")
+        
+        return (len(matched_items) > 0, matched_items, False)
+    
+    def make_request(self, url, data=None, headers=None):
+        """Make a single request with retry logic"""
+        last_error_type = None
+        
+        for attempt in range(self.retries):
+            try:
+                self.apply_rate_limit()
+                
+                if self.method == 'GET':
+                    response = self.session.get(url, headers=headers, timeout=5)
+                elif self.method == 'POST':
+                    response = self.session.post(url, data=data, headers=headers, timeout=5)
+                elif self.method == 'PUT':
+                    response = self.session.put(url, data=data, headers=headers, timeout=5)
+                elif self.method == 'DELETE':
+                    response = self.session.delete(url, headers=headers, timeout=5)
+                else:
+                    response = self.session.request(self.method, url, data=data, headers=headers, timeout=5)
+                
+                return (True, response, None)
+            
+            except requests.exceptions.Timeout:
+                last_error_type = "TIMEOUT"
+                
+            except requests.exceptions.ConnectionError:
+                last_error_type = "CONN_ERROR"
+                    
+            except requests.exceptions.TooManyRedirects:
+                last_error_type = "REDIRECTS"
+                break
+                
+            except requests.exceptions.SSLError:
+                last_error_type = "SSL_ERROR"
+                break
+                
+            except requests.exceptions.RequestException:
+                last_error_type = "REQUEST_ERROR"
+            
+            if attempt < self.retries - 1:
+                backoff = self.retry_delay * (2 ** attempt)
+                time.sleep(backoff)
+        
+        return (False, None, last_error_type)
+    
+    def fuzz_payloads(self, payloads):
+        """Fuzz with a set of payloads - called by each thread"""
+        url, data, headers = self.apply_payloads(payloads)
+        
+        success, response, error_type = self.make_request(url, data, headers)
+        
+        if success:
+            content = response.text
+            status_code = response.status_code
+            content_length = len(response.content)
+            
+            has_match, matched_items, should_exclude = self.check_content_match(content)
+            
+            if should_exclude:
+                return None
+            
+            is_anomaly, anomaly_reasons = self.check_baseline_anomaly(response)
+            
+            is_finding = False
+            finding_reasons = []
+            
+            if has_match:
+                is_finding = True
+                finding_reasons.extend(matched_items)
+                
+                with self.content_matches_lock:
+                    self.content_matches.append({
+                        'url': url,
+                        'payloads': payloads,
+                        'matches': matched_items
+                    })
+            
+            if is_anomaly:
+                is_finding = True
+                finding_reasons.extend(anomaly_reasons)
+                
+                with self.anomalies_lock:
+                    self.anomalies.append({
+                        'url': url,
+                        'payloads': payloads,
+                        'status': status_code,
+                        'length': content_length,
+                        'reasons': anomaly_reasons
+                    })
+            
+            if is_finding:
+                result = {
+                    'url': url,
+                    'payloads': payloads,
+                    'status': status_code,
+                    'length': content_length,
+                    'matches': matched_items,
+                    'anomaly_reasons': anomaly_reasons
+                }
+                
+                with self.results_lock:
+                    self.results.append(result)
+                
+                extras = []
+                if matched_items:
+                    extras.append(f"MATCH: {', '.join(matched_items)}")
+                if anomaly_reasons:
+                    extras.append(f"ANOMALY: {', '.join(anomaly_reasons)}")
+                
+                extra_info = f" [{'; '.join(extras)}]" if extras else ""
+                
+                # Show payloads in output if multiple injection points
+                payload_info = ""
+                if len(payloads) > 1:
+                    payload_info = f" (payloads: {payloads})"
+                
+                self.safe_print(
+                    f"[{status_code}] [{content_length} bytes] {url}{payload_info}{extra_info}"
+                )
+                
+                return result
+        else:
+            self.log_error(error_type, url)
+            self.safe_print(f"[{error_type}] {url} (after {self.retries} attempts)")
+        
+        return None
+    
+    def print_summary(self, elapsed):
+        """Print final summary"""
+        self.safe_print("-" * 60)
+        self.safe_print(f"Completed in {elapsed:.2f}s")
+        self.safe_print(f"Total findings: {len(self.results)}")
+        
+        if self.content_matches:
+            self.safe_print(f"Content matches: {len(self.content_matches)}")
+        
+        if self.anomalies:
+            self.safe_print(f"Baseline anomalies: {len(self.anomalies)}")
+        
+        if self.errors:
+            self.safe_print(f"Errors: {len(self.errors)}")
+            
+            error_counts = {}
+            for error in self.errors:
+                error_type = error['type']
+                error_counts[error_type] = error_counts.get(error_type, 0) + 1
+            
+            self.safe_print("\nError breakdown:")
+            for error_type, count in sorted(error_counts.items()):
+                self.safe_print(f"  {error_type}: {count}")
+        
+        if self.anomalies:
+            self.safe_print("\nBaseline anomalies detected:")
+            for anomaly in self.anomalies[:15]:
+                self.safe_print(f"  [{anomaly['status']}] [{anomaly['length']} bytes] {anomaly['url']}")
+                if len(anomaly['payloads']) > 1:
+                    self.safe_print(f"      Payloads: {anomaly['payloads']}")
+                for reason in anomaly['reasons']:
+                    self.safe_print(f"      -> {reason}")
+            
+            if len(self.anomalies) > 15:
+                self.safe_print(f"  ... and {len(self.anomalies) - 15} more")
+        
+        if self.content_matches:
+            self.safe_print("\nContent matches:")
+            for match in self.content_matches[:10]:
+                self.safe_print(f"  {match['url']}")
+                if len(match['payloads']) > 1:
+                    self.safe_print(f"      Payloads: {match['payloads']}")
+                for m in match['matches']:
+                    self.safe_print(f"      -> {m}")
+            
+            if len(self.content_matches) > 10:
+                self.safe_print(f"  ... and {len(self.content_matches) - 10} more")
+    
+    def run(self):
+        """Execute the fuzzer"""
+        # Validate injection points
+        if not self.injection_points:
+            print("[!] No injection points found. Use FUZZ, FUZZ2, FUZZ3, etc.")
+            return
+        
+        self.safe_print(f"[*] Found {len(self.injection_points)} injection point(s): {self.injection_points}")
+        
+        # Generate payload combinations
+        self.safe_print("[*] Loading wordlists and generating payload combinations...")
+        combinations = self.generate_payload_combinations()
+        
+        if not combinations:
+            print("[!] No payloads generated")
+            return
+        
+        self.safe_print(f"[+] Generated {len(combinations)} payload combinations")
+        
+        # Test connectivity
+        test_payloads = tuple(['test'] * len(self.injection_points))
+        test_url, _, _ = self.apply_payloads(test_payloads)
+        self.safe_print(f"\n[*] Testing connectivity to target...")
+        
+        try:
+            self.session.get(test_url.replace('test', ''), timeout=5)
+            self.safe_print("[+] Target is reachable\n")
+        except requests.exceptions.RequestException as e:
+            self.safe_print(f"[!] Warning: Initial connection test failed: {e}")
+            self.safe_print("[*] Continuing anyway...\n")
+        
+        # Establish baseline
+        if not self.establish_baseline():
+            self.safe_print("[!] Continuing without baseline comparison")
+        
+        self.safe_print("")
+        self.safe_print(f"Target: {self.target_url}")
+        self.safe_print(f"Method: {self.method}")
+        self.safe_print(f"Injection points: {self.injection_points}")
+        self.safe_print(f"Payload combinations: {len(combinations)}")
+        self.safe_print(f"Threads: {self.threads}")
+        self.safe_print(f"Delay: {self.delay}s between requests")
+        self.safe_print(f"Retries: {self.retries} (with exponential backoff)")
+        
+        if self.headers:
+            self.safe_print(f"Custom headers: {list(self.headers.keys())}")
+        
+        if self.post_data:
+            self.safe_print(f"POST data template: {self.post_data[:50]}...")
+        
+        if self.match_strings or self.match_regex:
+            self.safe_print(f"Match strings: {self.match_strings}")
+            self.safe_print(f"Match regex: {self.match_regex}")
+        
+        self.safe_print("-" * 60)
+        
+        start_time = time.time()
+        
+        with ThreadPoolExecutor(max_workers=self.threads) as executor:
+            futures = {
+                executor.submit(self.fuzz_payloads, combo): combo 
+                for combo in combinations
+            }
+            
+            for future in as_completed(futures):
+                pass
+        
+        elapsed = time.time() - start_time
+        self.print_summary(elapsed)
+
+
+def parse_headers(header_list):
+    """Parse header arguments into dictionary"""
+    headers = {}
+    if header_list:
+        for h in header_list:
+            if ':' in h:
+                key, value = h.split(':', 1)
+                headers[key.strip()] = value.strip()
+    return headers
+
+
+def parse_cookies(cookie_string):
+    """Parse cookie string into dictionary"""
+    cookies = {}
+    if cookie_string:
+        for pair in cookie_string.split(';'):
+            if '=' in pair:
+                key, value = pair.split('=', 1)
+                cookies[key.strip()] = value.strip()
+    return cookies
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Threaded Web Fuzzer with Multiple Injection Points",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic directory fuzzing
+  python fuzzer.py -u http://example.com/FUZZ -w wordlist.txt
+
+  # Multiple injection points (username and password)
+  python fuzzer.py -u "http://example.com/login" -w users.txt -w2 passwords.txt \\
+      -X POST -d "username=FUZZ&password=FUZZ2"
+
+  # Header injection with authentication
+  python fuzzer.py -u http://example.com/api/FUZZ -w endpoints.txt \\
+      -H "Authorization: Bearer FUZZ2" -w2 tokens.txt
+
+  # Fuzz with content matching
+  python fuzzer.py -u http://example.com/FUZZ -w wordlist.txt \\
+      -ms "error,exception,sql" -mr "error.*line [0-9]+"
+
+  # Multiple injection points in URL
+  python fuzzer.py -u "http://example.com/FUZZ/action/FUZZ2" \\
+      -w directories.txt -w2 actions.txt
+
+Injection Points:
+  Use FUZZ for first wordlist, FUZZ2 for second, FUZZ3 for third, etc.
+  Injection points can be placed in: URL, POST data, headers, cookies
+        """
+    )
+    
+    # Required arguments
+    parser.add_argument('-u', '--url', required=True,
+                        help='Target URL with FUZZ placeholder(s)')
+    parser.add_argument('-w', '--wordlist', required=True,
+                        help='Primary wordlist for FUZZ')
+    
+    # Additional wordlists
+    parser.add_argument('-w2', '--wordlist2', help='Wordlist for FUZZ2')
+    parser.add_argument('-w3', '--wordlist3', help='Wordlist for FUZZ3')
+    parser.add_argument('-w4', '--wordlist4', help='Wordlist for FUZZ4')
+    
+    # HTTP options
+    parser.add_argument('-X', '--method', default='GET',
+                        help='HTTP method (default: GET)')
+    parser.add_argument('-d', '--data',
+                        help='POST data (can include FUZZ placeholders)')
+    parser.add_argument('-H', '--header', action='append',
+                        help='Custom header (can use multiple, format: "Name: Value")')
+    parser.add_argument('-b', '--cookies',
+                        help='Cookies (format: "name=value; name2=value2")')
+    
+    # Performance options
+    parser.add_argument('-t', '--threads', type=int, default=10,
+                        help='Number of threads (default: 10)')
+    parser.add_argument('--delay', type=float, default=0,
+                        help='Delay between requests in seconds (default: 0)')
+    parser.add_argument('--retries', type=int, default=3,
+                        help='Retry attempts for failed requests (default: 3)')
+    
+    # Content matching
+    parser.add_argument('-ms', '--match-strings',
+                        help='Comma-separated strings to match')
+    parser.add_argument('-mr', '--match-regex',
+                        help='Comma-separated regex patterns to match')
+    parser.add_argument('-xs', '--exclude-strings',
+                        help='Comma-separated strings to exclude')
+    parser.add_argument('-xr', '--exclude-regex',
+                        help='Comma-separated regex patterns to exclude')
+    
+    # Baseline options
+    parser.add_argument('--length-threshold', type=int, default=50,
+                        help='Byte difference threshold for anomaly detection (default: 50)')
+    parser.add_argument('--similarity-threshold', type=float, default=0.9,
+                        help='Content similarity threshold 0-1 (default: 0.9)')
+    
+    args = parser.parse_args()
+    
+    # Build additional wordlists list
+    additional_wordlists = []
+    if args.wordlist2:
+        additional_wordlists.append(args.wordlist2)
+    if args.wordlist3:
+        additional_wordlists.append(args.wordlist3)
+    if args.wordlist4:
+        additional_wordlists.append(args.wordlist4)
+    
+    # Parse comma-separated arguments
+    match_strings = [s.strip() for s in args.match_strings.split(',')] if args.match_strings else []
+    match_regex = [s.strip() for s in args.match_regex.split(',')] if args.match_regex else []
+    exclude_strings = [s.strip() for s in args.exclude_strings.split(',')] if args.exclude_strings else []
+    exclude_regex = [s.strip() for s in args.exclude_regex.split(',')] if args.exclude_regex else []
+    
+    fuzzer = ThreadedFuzzer(
+        target_url=args.url,
+        wordlist_path=args.wordlist,
+        threads=args.threads,
+        delay=args.delay,
+        retries=args.retries,
+        match_strings=match_strings,
+        match_regex=match_regex,
+        exclude_strings=exclude_strings,
+        exclude_regex=exclude_regex,
+        length_threshold=args.length_threshold,
+        similarity_threshold=args.similarity_threshold,
+        method=args.method,
+        headers=parse_headers(args.header),
+        cookies=parse_cookies(args.cookies),
+        post_data=args.data,
+        additional_wordlists=additional_wordlists
+    )
+    
+    fuzzer.run()
